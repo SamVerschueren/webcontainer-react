@@ -1,23 +1,23 @@
-import type { WebContainer, WebContainerProcess } from '@webcontainer/api';
-import type { SandpackFiles, SandpackListener, SandpackMessage } from './types';
-import { rootPackageJson, rootPackageJsonLock } from './templates/vite-react';
+import type { WebContainer, WebContainerProcess } from "@webcontainer/api";
+import type { SandpackFiles, SandpackListener, SandpackMessage, SandpackTemplate } from "./types";
 
 export interface ProjectInfo {
   previewUrl: string | null;
-  status: 'registered' | 'starting' | 'ready' | 'error';
+  status: "registered" | "starting" | "ready" | "error";
 }
 
 interface ProjectState {
   files: SandpackFiles;
-  viteProcess: WebContainerProcess | null;
+  templateId: string;
+  serverProcess: WebContainerProcess | null;
   previewUrl: string | null;
   port: number;
   listeners: Set<SandpackListener>;
 }
 
-const MAX_CONCURRENT_VITE = 3;
-const BASE_PORT = 3001;
-const VITE_TIMEOUT_MS = 60_000;
+const MAX_CONCURRENT_SERVERS = 20;
+const BASE_PORT = 5173;
+const SERVER_TIMEOUT_MS = 60_000;
 
 /**
  * Injected into every preview iframe via setPreviewScript to bridge
@@ -66,8 +66,7 @@ const BRIDGE_SCRIPT = `(function() {
 
   // --- Resize observation ---
   function observeResize() {
-    var root = document.getElementById('root');
-    if (!root) return;
+    var root = document.getElementById('root') || document.body;
     new ResizeObserver(function(entries) {
       const { body } = document;
       const html = document.documentElement;
@@ -128,8 +127,10 @@ export class WebContainerManager {
   private bootPromise: Promise<WebContainer> | null = null;
   private projects = new Map<string, ProjectState>();
   private nextPort = BASE_PORT;
-  private activeViteCount = 0;
+  private activeServerCount = 0;
   private pendingServerReady = new Map<number, { resolve: (url: string) => void; reject: (err: Error) => void }>();
+  private installedTemplates = new Set<string>();
+  private templateInstallPromises = new Map<string, Promise<void>>();
 
   static getInstance(): WebContainerManager {
     if (!WebContainerManager.instance) {
@@ -153,12 +154,11 @@ export class WebContainerManager {
       return this.bootPromise;
     }
 
-    this.bootPromise = import('@webcontainer/api')
+    this.bootPromise = import("@webcontainer/api")
       .then((module) => module.WebContainer.boot())
       .then(async (container) => {
         this.container = container;
         this.setupContainerListeners(container);
-        await this.installSharedDependencies(container);
         await container.setPreviewScript(BRIDGE_SCRIPT);
         return container;
       });
@@ -167,20 +167,45 @@ export class WebContainerManager {
   }
 
   /**
-   * Mounts the shared package.json at /projects/ and runs
-   * `npm install` once so all project subdirectories can
-   * resolve packages via Node's upward module resolution.
+   * Installs a template's dependencies at /templates/{id}/ if not
+   * already installed. Deduplicates concurrent calls for the same
+   * template id. Project subdirectories resolve packages via
+   * Node's standard upward module resolution.
    */
-  private async installSharedDependencies(container: WebContainer): Promise<void> {
-    await container.fs.mkdir('/projects', { recursive: true });
-    await container.fs.writeFile('/projects/package.json', rootPackageJson);
-    await container.fs.writeFile('/projects/package-lock.json', rootPackageJsonLock);
+  async ensureTemplateInstalled(template: SandpackTemplate): Promise<void> {
+    if (this.installedTemplates.has(template.id)) {
+      return;
+    }
 
-    const install = await container.spawn('npm', ['install'], {
-      cwd: '/projects',
-    });
+    const existing = this.templateInstallPromises.get(template.id);
+    if (existing) {
+      return existing;
+    }
 
-    let installOutput = '';
+    const promise = this.doInstallTemplate(template);
+    this.templateInstallPromises.set(template.id, promise);
+
+    try {
+      await promise;
+      this.installedTemplates.add(template.id);
+    } finally {
+      this.templateInstallPromises.delete(template.id);
+    }
+  }
+
+  private async doInstallTemplate(template: SandpackTemplate): Promise<void> {
+    const container = await this.boot();
+    const dir = `/templates/${template.id}`;
+
+    await container.fs.mkdir(dir, { recursive: true });
+    await container.fs.writeFile(`${dir}/package.json`, template.environment.packageJson);
+    if (template.environment.packageLockJson) {
+      await container.fs.writeFile(`${dir}/package-lock.json`, template.environment.packageLockJson);
+    }
+
+    const install = await container.spawn("npm", ["install"], { cwd: dir, output: true });
+
+    let installOutput = "";
     install.output
       .pipeTo(
         new WritableStream({
@@ -193,17 +218,19 @@ export class WebContainerManager {
 
     const exitCode = await install.exit;
     if (exitCode !== 0) {
-      throw new Error(`Shared dependency install failed (exit ${exitCode}):\n${installOutput}`);
+      throw new Error(`Template '${template.id}' install failed (exit ${exitCode}):\n${installOutput}`);
     }
   }
 
   private setupContainerListeners(container: WebContainer): void {
-    container.on('server-ready', (port: number, url: string) => {
+    container.on("server-ready", (port: number, url: string) => {
+      console.log("server-ready", port, url);
+
       const projects = Array.from(this.projects.values());
       for (let i = 0; i < projects.length; i++) {
         if (projects[i].port === port) {
           projects[i].previewUrl = url;
-          this.emit(projects[i], { type: 'done' });
+          this.emit(projects[i], { type: "done" });
           break;
         }
       }
@@ -217,16 +244,17 @@ export class WebContainerManager {
   }
 
   /**
-   * Registers a project with a unique ID and assigns it a port.
-   * No-op if the project is already registered.
+   * Registers a project with a unique ID, associates it with a
+   * template, and assigns it a port. No-op if already registered.
    */
-  registerProject(id: string, files: SandpackFiles): void {
+  registerProject(id: string, files: SandpackFiles, templateId: string): void {
     if (this.projects.has(id)) {
       return;
     }
     this.projects.set(id, {
       files: { ...files },
-      viteProcess: null,
+      templateId,
+      serverProcess: null,
       previewUrl: null,
       port: this.nextPort++,
       listeners: new Set(),
@@ -242,20 +270,20 @@ export class WebContainerManager {
   }
 
   /**
-   * Writes all provided files into /projects/{id}/, creating
-   * directories as needed. Merges into existing project files.
+   * Writes all provided files into /templates/{templateId}/projects/{id}/,
+   * creating directories as needed. Merges into existing project files.
    */
   async mountFiles(id: string, files: SandpackFiles): Promise<void> {
     const container = await this.boot();
     const project = this.getProjectOrThrow(id);
-    const base = `/projects/${id}`;
+    const base = `/templates/${project.templateId}/projects/${id}`;
 
     const dirs = new Set<string>();
     for (const filePath of Object.keys(files)) {
-      const parts = filePath.split('/').filter(Boolean);
+      const parts = filePath.split("/").filter(Boolean);
       // Collect every ancestor directory under the project root
       for (let i = 1; i < parts.length; i++) {
-        dirs.add(`${base}/${parts.slice(0, i).join('/')}`);
+        dirs.add(`${base}/${parts.slice(0, i).join("/")}`);
       }
     }
 
@@ -276,42 +304,48 @@ export class WebContainerManager {
    */
   async writeFile(id: string, filePath: string, content: string): Promise<void> {
     const container = await this.boot();
-    const fullPath = `/projects/${id}${filePath}`;
-    const parentDir = fullPath.substring(0, fullPath.lastIndexOf('/'));
+    const project = this.getProjectOrThrow(id);
+    const fullPath = `/templates/${project.templateId}/projects/${id}${filePath}`;
+    const parentDir = fullPath.substring(0, fullPath.lastIndexOf("/"));
     await container.fs.mkdir(parentDir, { recursive: true });
     await container.fs.writeFile(fullPath, content);
   }
 
   /**
-   * Starts Vite in the project folder. Shared dependencies are
-   * already installed at /projects/ during boot().
+   * Starts the dev server in the project folder using the
+   * template's startCommand. Template dependencies must already
+   * be installed via ensureTemplateInstalled().
    * Resolves with the preview URL once the dev server is ready.
    */
-  async spawnVite(id: string): Promise<string> {
+  async spawnDevServer(id: string, template: SandpackTemplate): Promise<string> {
     const container = await this.boot();
     const project = this.getProjectOrThrow(id);
-    const cwd = `/projects/${id}`;
+    const cwd = `/templates/${template.id}/projects/${id}`;
 
-    this.emit(project, { type: 'start', firstLoad: true });
+    this.emit(project, { type: "start", firstLoad: true });
 
     // --- Evict oldest project if at the concurrency limit ---
-    if (this.activeViteCount >= MAX_CONCURRENT_VITE) {
+    if (this.activeServerCount >= MAX_CONCURRENT_SERVERS) {
       const entries = Array.from(this.projects.entries());
       for (let i = 0; i < entries.length; i++) {
         const [otherId, other] = entries[i];
-        if (otherId !== id && other.viteProcess) {
+        if (otherId !== id && other.serverProcess) {
           await this.killProject(otherId);
           break;
         }
       }
     }
 
-    // --- Start Vite dev server ---
+    // --- Build the command from the template, replacing {{port}} ---
+    const args = template.environment.startCommand.map((arg) => (arg === "{{port}}" ? String(project.port) : arg));
+    const [cmd, ...cmdArgs] = args;
+
+    // --- Start dev server ---
     const url = await new Promise<string>((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.pendingServerReady.delete(project.port);
-        reject(new Error('Vite server did not start within 60 seconds'));
-      }, VITE_TIMEOUT_MS);
+        reject(new Error("Dev server did not start within 60 seconds"));
+      }, SERVER_TIMEOUT_MS);
 
       this.pendingServerReady.set(project.port, {
         resolve: (serverUrl: string) => {
@@ -325,25 +359,32 @@ export class WebContainerManager {
       });
 
       container
-        .spawn('npx', ['vite', '--port', String(project.port)], { cwd })
+        .spawn(cmd, cmdArgs, { cwd, output: true })
         .then((proc) => {
-          project.viteProcess = proc;
-          this.activeViteCount++;
+          project.serverProcess = proc;
+          this.activeServerCount++;
 
-          // Drain output so the process doesn't stall on back-pressure
-          proc.output.pipeTo(new WritableStream({ write() {} })).catch(() => {});
+          proc.output
+            .pipeTo(
+              new WritableStream({
+                write(chunk) {
+                  console.log(chunk);
+                },
+              }),
+            )
+            .catch(() => {});
 
           proc.exit.then((code) => {
-            if (project.viteProcess === proc) {
-              this.activeViteCount = Math.max(0, this.activeViteCount - 1);
-              project.viteProcess = null;
+            if (project.serverProcess === proc) {
+              this.activeServerCount = Math.max(0, this.activeServerCount - 1);
+              project.serverProcess = null;
             }
 
             if (!project.previewUrl) {
               const pending = this.pendingServerReady.get(project.port);
               if (pending) {
                 this.pendingServerReady.delete(project.port);
-                pending.reject(new Error(`Vite exited (code ${code}) before server was ready`));
+                pending.reject(new Error(`Dev server exited (code ${code}) before server was ready`));
               }
             }
           });
@@ -359,8 +400,8 @@ export class WebContainerManager {
   }
 
   /**
-   * Kills the Vite process for the project.
-   * The project stays registered and can be restarted with spawnVite().
+   * Kills the dev server process for the project.
+   * The project stays registered and can be restarted with spawnDevServer().
    */
   async killProject(id: string): Promise<void> {
     const project = this.projects.get(id);
@@ -368,10 +409,10 @@ export class WebContainerManager {
       return;
     }
 
-    if (project.viteProcess) {
-      const proc = project.viteProcess;
-      project.viteProcess = null;
-      this.activeViteCount = Math.max(0, this.activeViteCount - 1);
+    if (project.serverProcess) {
+      const proc = project.serverProcess;
+      project.serverProcess = null;
+      this.activeServerCount = Math.max(0, this.activeServerCount - 1);
       proc.kill();
       await proc.exit;
     }
@@ -396,19 +437,19 @@ export class WebContainerManager {
     if (!project) {
       return undefined;
     }
-    let status: ProjectInfo['status'];
+    let status: ProjectInfo["status"];
     if (project.previewUrl) {
-      status = 'ready';
-    } else if (project.viteProcess) {
-      status = 'starting';
+      status = "ready";
+    } else if (project.serverProcess) {
+      status = "starting";
     } else {
-      status = 'registered';
+      status = "registered";
     }
     return { previewUrl: project.previewUrl, status };
   }
 
-  getActiveViteCount(): number {
-    return this.activeViteCount;
+  getActiveServerCount(): number {
+    return this.activeServerCount;
   }
 
   private getProjectOrThrow(id: string): ProjectState {

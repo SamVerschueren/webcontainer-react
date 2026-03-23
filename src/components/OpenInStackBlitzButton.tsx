@@ -1,6 +1,5 @@
 import type {ReactNode} from 'react';
 import {useSandpack} from '../hooks/useSandpack';
-import {rootPackageJson, rootPackageJsonLock} from '../templates/vite-react';
 
 interface OpenInStackBlitzButtonProps {
   className?: string;
@@ -14,11 +13,17 @@ export function OpenInStackBlitzButton({
   children,
 }: OpenInStackBlitzButtonProps) {
   const {sandpack} = useSandpack();
+  const {templateEnvironment} = sandpack;
 
   function handleOpen() {
+    const appFile =
+      sandpack.files['/src/App.jsx'] || sandpack.files['src/App.jsx']
+        ? 'src/App.jsx'
+        : 'src/App.js';
+
     const form = document.createElement('form');
     form.method = 'POST';
-    form.action = 'https://stackblitz.com/run?file=src/App.js';
+    form.action = `https://stackblitz.com/run?file=${encodeURIComponent(appFile)}`;
     form.target = '_blank';
 
     addInput(form, 'project[title]', 'React Sandbox');
@@ -29,12 +34,14 @@ export function OpenInStackBlitzButton({
     );
 
     if (!hasPackageJson) {
-      addInput(form, 'project[files][package.json]', rootPackageJson);
-      addInput(
-        form,
-        'project[files][package-lock.json]',
-        rootPackageJsonLock
-      );
+      addInput(form, 'project[files][package.json]', templateEnvironment.packageJson);
+      if (templateEnvironment.packageLockJson) {
+        addInput(
+          form,
+          'project[files][package-lock.json]',
+          templateEnvironment.packageLockJson
+        );
+      }
     }
 
     for (const [path, {code}] of Object.entries(sandpack.files)) {

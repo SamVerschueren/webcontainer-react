@@ -1,7 +1,6 @@
 import {useState, useEffect, useRef, useCallback, useMemo} from 'react';
 import {SandpackContext} from './context';
 import {WebContainerManager} from './WebContainerManager';
-import {viteReactTemplate} from './templates/vite-react';
 import type {
   SandpackProviderProps,
   SandpackFiles,
@@ -43,6 +42,7 @@ function filesToCodeMap(
 }
 
 export function SandpackProvider({
+  template,
   files: userFiles,
   options,
   children,
@@ -56,9 +56,9 @@ export function SandpackProvider({
   // Stable project ID, generated once per mount
   const [projectId] = useState(() => `sp-${nextProjectId++}`);
 
-  // Snapshot of merged template + user files at mount time
+  // Snapshot of merged template + user files at mount time (user wins)
   const initialFilesRef = useRef<SandpackFiles>({
-    ...viteReactTemplate,
+    ...template.files,
     ...userFiles,
   });
 
@@ -174,12 +174,12 @@ export function SandpackProvider({
     return () => observer.disconnect();
   }, [initMode, isVisible, initModeObserverOptions]);
 
-  // ---- Boot WebContainer, mount files, spawn Vite ----
+  // ---- Boot WebContainer, install template, mount files, spawn dev server ----
 
   useEffect(() => {
     if (!isVisible || !autorun) return;
 
-    manager.registerProject(projectId, initialFilesRef.current);
+    manager.registerProject(projectId, initialFilesRef.current, template.id);
     const unsubListener = manager.addListener(projectId, emit);
 
     let cancelled = false;
@@ -190,11 +190,14 @@ export function SandpackProvider({
         await manager.boot();
         if (cancelled) return;
 
+        await manager.ensureTemplateInstalled(template);
+        if (cancelled) return;
+
         await manager.mountFiles(projectId, initialFilesRef.current);
         if (cancelled) return;
 
         setStatus('running');
-        const url = await manager.spawnVite(projectId);
+        const url = await manager.spawnDevServer(projectId, template);
         if (cancelled) return;
 
         setBasePreviewUrl(url);
@@ -214,7 +217,7 @@ export function SandpackProvider({
       unsubListener();
       manager.unregisterProject(projectId);
     };
-  }, [isVisible, autorun, projectId, emit, manager]);
+  }, [isVisible, autorun, projectId, emit, manager, template]);
 
   // ---- Forward iframe postMessage (console / resize) to listeners ----
 
@@ -261,6 +264,7 @@ export function SandpackProvider({
       resetAllFiles,
       previewUrl,
       updateFile,
+      templateEnvironment: template.environment,
     }),
     [
       files,
@@ -273,6 +277,7 @@ export function SandpackProvider({
       resetAllFiles,
       previewUrl,
       updateFile,
+      template.environment,
     ]
   );
 

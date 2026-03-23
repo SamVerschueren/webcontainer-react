@@ -9,6 +9,36 @@ export interface SandpackFile {
 
 export type SandpackFiles = Record<string, SandpackFile>;
 
+// ---- Template ----
+
+export interface SandpackTemplate {
+  id: string;
+  files: SandpackFiles;
+  environment: {
+    packageJson: string;
+    packageLockJson?: string;
+    startCommand: [string, ...string[]];
+  };
+}
+
+export function defineTemplate(template: SandpackTemplate): SandpackTemplate {
+  if (!template.id) {
+    throw new Error('SandpackTemplate requires a non-empty id');
+  }
+  if (!template.environment.packageJson) {
+    throw new Error('SandpackTemplate requires environment.packageJson');
+  }
+  if (
+    !template.environment.startCommand ||
+    template.environment.startCommand.length === 0
+  ) {
+    throw new Error(
+      'SandpackTemplate requires a non-empty environment.startCommand'
+    );
+  }
+  return template;
+}
+
 // ---- Status ----
 
 export type SandpackStatus =
@@ -107,6 +137,7 @@ export interface SandpackState {
   resetAllFiles: () => void;
   previewUrl: string | null;
   updateFile: (path: string, code: string) => void;
+  templateEnvironment: SandpackTemplate['environment'];
 }
 
 export type SandpackListener = (msg: SandpackMessage) => void;
@@ -133,6 +164,7 @@ export type LoadingOverlayState =
 // ---- Provider props ----
 
 export interface SandpackProviderProps {
+  template: SandpackTemplate;
   files: SandpackFiles;
   theme?: SandpackTheme;
   options?: {

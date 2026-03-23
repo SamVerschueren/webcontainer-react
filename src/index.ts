@@ -2,6 +2,7 @@
 export type {
   SandpackFile,
   SandpackFiles,
+  SandpackTemplate,
   SandpackMessage,
   SandpackMessageConsoleMethods,
   SandpackState,
@@ -20,6 +21,8 @@ export type {
   LoadingOverlayState,
   UnsubscribeFunction,
 } from './types';
+
+export {defineTemplate} from './types';
 
 // Context
 export {SandpackContext as SandpackReactContext} from './context';
