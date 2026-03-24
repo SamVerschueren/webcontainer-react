@@ -29,24 +29,18 @@ export function OpenInStackBlitzButton({
     addInput(form, 'project[title]', 'React Sandbox');
     addInput(form, 'project[template]', 'node');
 
-    const hasPackageJson = Object.keys(sandpack.files).some(
-      (p) => p === '/package.json' || p === 'package.json'
-    );
-
-    if (!hasPackageJson) {
-      addInput(form, 'project[files][package.json]', templateEnvironment.packageJson);
-      if (templateEnvironment.packageLockJson) {
-        addInput(
-          form,
-          'project[files][package-lock.json]',
-          templateEnvironment.packageLockJson
-        );
-      }
-    }
-
     for (const [path, {code}] of Object.entries(sandpack.files)) {
       const normalized = path.startsWith('/') ? path.slice(1) : path;
       addInput(form, `project[files][${normalized}]`, code);
+    }
+
+    addInput(form, 'project[files][package.json]', templateEnvironment.packageJson);
+    if (templateEnvironment.packageLockJson) {
+      addInput(
+        form,
+        'project[files][package-lock.json]',
+        templateEnvironment.packageLockJson
+      );
     }
 
     document.body.appendChild(form);

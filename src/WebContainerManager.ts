@@ -9,13 +9,16 @@ export interface ProjectInfo {
 interface ProjectState {
   files: SandpackFiles;
   templateId: string;
-  serverProcess: WebContainerProcess | null;
   previewUrl: string | null;
-  port: number;
   listeners: Set<SandpackListener>;
 }
 
-const MAX_CONCURRENT_SERVERS = 20;
+interface ServerEntry {
+  port: number;
+  process: WebContainerProcess | null;
+  previewUrl: string | null;
+}
+
 const BASE_PORT = 5173;
 const SERVER_TIMEOUT_MS = 60_000;
 
@@ -28,6 +31,9 @@ const SERVER_TIMEOUT_MS = 60_000;
  */
 const BRIDGE_SCRIPT = `(function() {
   var _msgId = 0;
+  var _match = window.location.pathname.match(/\\/projects\\/([^\\/]+)/);
+
+  const projectId = _match ? _match[1] : null;
 
   // --- Console interception ---
   var methods = ['log', 'info', 'warn', 'error', 'debug'];
@@ -45,6 +51,7 @@ const BRIDGE_SCRIPT = `(function() {
       window.parent.postMessage({
         type: 'console',
         codesandbox: true,
+        projectId,
         log: [{
           method: method,
           id: String(_msgId++),
@@ -60,6 +67,7 @@ const BRIDGE_SCRIPT = `(function() {
     window.parent.postMessage({
       type: 'console',
       codesandbox: true,
+      projectId,
       log: [{ method: 'clear', id: String(_msgId++), data: [] }]
     }, '*');
   };
@@ -75,6 +83,7 @@ const BRIDGE_SCRIPT = `(function() {
       window.parent.postMessage({
         type: 'resize',
         height,
+        projectId,
       }, '*');
     }).observe(root);
   }
@@ -90,6 +99,7 @@ const BRIDGE_SCRIPT = `(function() {
     window.parent.postMessage({
       type: 'console',
       codesandbox: true,
+      projectId,
       log: [{
         method: 'error',
         id: String(_msgId++),
@@ -105,6 +115,7 @@ const BRIDGE_SCRIPT = `(function() {
     window.parent.postMessage({
       type: 'console',
       codesandbox: true,
+      projectId,
       log: [{
         method: 'error',
         id: String(_msgId++),
@@ -127,10 +138,12 @@ export class WebContainerManager {
   private bootPromise: Promise<WebContainer> | null = null;
   private projects = new Map<string, ProjectState>();
   private nextPort = BASE_PORT;
-  private activeServerCount = 0;
   private pendingServerReady = new Map<number, { resolve: (url: string) => void; reject: (err: Error) => void }>();
   private installedTemplates = new Set<string>();
   private templateInstallPromises = new Map<string, Promise<void>>();
+  private servers = new Map<string, ServerEntry>();
+  private serverPromises = new Map<string, Promise<string>>();
+  private templates = new Map<string, SandpackTemplate>();
 
   static getInstance(): WebContainerManager {
     if (!WebContainerManager.instance) {
@@ -173,6 +186,8 @@ export class WebContainerManager {
    * Node's standard upward module resolution.
    */
   async ensureTemplateInstalled(template: SandpackTemplate): Promise<void> {
+    this.templates.set(template.id, template);
+
     if (this.installedTemplates.has(template.id)) {
       return;
     }
@@ -203,6 +218,21 @@ export class WebContainerManager {
       await container.fs.writeFile(`${dir}/package-lock.json`, template.environment.packageLockJson);
     }
 
+    // Write shared template files (vite.config, framework entries, etc.)
+    const sharedDirs = new Set<string>();
+    for (const filePath of Object.keys(template.sharedFiles)) {
+      const parts = filePath.split("/").filter(Boolean);
+      for (let i = 1; i < parts.length; i++) {
+        sharedDirs.add(`${dir}/${parts.slice(0, i).join("/")}`);
+      }
+    }
+    for (const sharedDir of Array.from(sharedDirs).sort()) {
+      await container.fs.mkdir(sharedDir, { recursive: true });
+    }
+    for (const [filePath, file] of Object.entries(template.sharedFiles)) {
+      await container.fs.writeFile(`${dir}${filePath}`, file.code);
+    }
+
     const install = await container.spawn("npm", ["install"], { cwd: dir, output: true });
 
     let installOutput = "";
@@ -226,11 +256,9 @@ export class WebContainerManager {
     container.on("server-ready", (port: number, url: string) => {
       console.log("server-ready", port, url);
 
-      const projects = Array.from(this.projects.values());
-      for (let i = 0; i < projects.length; i++) {
-        if (projects[i].port === port) {
-          projects[i].previewUrl = url;
-          this.emit(projects[i], { type: "done" });
+      for (const server of this.servers.values()) {
+        if (server.port === port) {
+          server.previewUrl = url;
           break;
         }
       }
@@ -244,8 +272,8 @@ export class WebContainerManager {
   }
 
   /**
-   * Registers a project with a unique ID, associates it with a
-   * template, and assigns it a port. No-op if already registered.
+   * Registers a project with a unique ID and associates it with a
+   * template. No-op if already registered.
    */
   registerProject(id: string, files: SandpackFiles, templateId: string): void {
     if (this.projects.has(id)) {
@@ -254,34 +282,44 @@ export class WebContainerManager {
     this.projects.set(id, {
       files: { ...files },
       templateId,
-      serverProcess: null,
       previewUrl: null,
-      port: this.nextPort++,
       listeners: new Set(),
     });
   }
 
   /**
-   * Kills any running processes and removes the project entirely.
+   * Removes the project registration and cleans up its state.
+   * Template servers are left running for other projects to use.
+   * Isolated-mode project servers are killed.
    */
   async unregisterProject(id: string): Promise<void> {
-    await this.killProject(id);
+    const project = this.projects.get(id);
+    if (project) {
+      project.previewUrl = null;
+      project.listeners.clear();
+      this.cleanupProjectServer(id);
+    }
     this.projects.delete(id);
   }
 
   /**
    * Writes all provided files into /templates/{templateId}/projects/{id}/,
    * creating directories as needed. Merges into existing project files.
+   *
+   * In isolated mode, also copies the template's sharedFiles into the
+   * project directory so the per-project dev server can find them at its cwd.
    */
   async mountFiles(id: string, files: SandpackFiles): Promise<void> {
     const container = await this.boot();
     const project = this.getProjectOrThrow(id);
+    const template = this.templates.get(project.templateId);
     const base = `/templates/${project.templateId}/projects/${id}`;
 
+    const filesToWrite = template?.serverMode === "isolated" ? { ...template.sharedFiles, ...files } : files;
+
     const dirs = new Set<string>();
-    for (const filePath of Object.keys(files)) {
+    for (const filePath of Object.keys(filesToWrite)) {
       const parts = filePath.split("/").filter(Boolean);
-      // Collect every ancestor directory under the project root
       for (let i = 1; i < parts.length; i++) {
         dirs.add(`${base}/${parts.slice(0, i).join("/")}`);
       }
@@ -291,7 +329,7 @@ export class WebContainerManager {
       await container.fs.mkdir(dir, { recursive: true });
     }
 
-    for (const [filePath, file] of Object.entries(files)) {
+    for (const [filePath, file] of Object.entries(filesToWrite)) {
       await container.fs.writeFile(`${base}${filePath}`, file.code);
     }
 
@@ -312,42 +350,91 @@ export class WebContainerManager {
   }
 
   /**
-   * Starts the dev server in the project folder using the
-   * template's startCommand. Template dependencies must already
-   * be installed via ensureTemplateInstalled().
-   * Resolves with the preview URL once the dev server is ready.
+   * Starts a dev server for the project. In shared mode (default),
+   * reuses the template's single server and returns a path-qualified
+   * URL. In isolated mode, spawns a dedicated server per project and
+   * returns the bare server URL.
    */
   async spawnDevServer(id: string, template: SandpackTemplate): Promise<string> {
-    const container = await this.boot();
     const project = this.getProjectOrThrow(id);
-    const cwd = `/templates/${template.id}/projects/${id}`;
 
     this.emit(project, { type: "start", firstLoad: true });
 
-    // --- Evict oldest project if at the concurrency limit ---
-    if (this.activeServerCount >= MAX_CONCURRENT_SERVERS) {
-      const entries = Array.from(this.projects.entries());
-      for (let i = 0; i < entries.length; i++) {
-        const [otherId, other] = entries[i];
-        if (otherId !== id && other.serverProcess) {
-          await this.killProject(otherId);
-          break;
-        }
-      }
+    let url: string;
+    if (template.serverMode === "isolated") {
+      url = await this.startProjectServer(id, template);
+    } else {
+      const serverUrl = await this.ensureTemplateServerRunning(template);
+      url = `${serverUrl}/projects/${id}/`;
     }
 
-    // --- Build the command from the template, replacing {{port}} ---
-    const args = template.environment.startCommand.map((arg) => (arg === "{{port}}" ? String(project.port) : arg));
+    project.previewUrl = url;
+    this.emit(project, { type: "done" });
+    return url;
+  }
+
+  /**
+   * Starts a single Vite dev server at the template root if one
+   * isn't already running. Deduplicates concurrent calls for the
+   * same template. Returns the base server URL.
+   */
+  private async ensureTemplateServerRunning(template: SandpackTemplate): Promise<string> {
+    return this.ensureServerRunning(template.id, `/templates/${template.id}`, template);
+  }
+
+  private async startProjectServer(id: string, template: SandpackTemplate): Promise<string> {
+    return this.ensureServerRunning(id, `/templates/${template.id}/projects/${id}`, template);
+  }
+
+  /**
+   * Ensures a server is running for the given key (template ID for
+   * shared mode, project ID for isolated mode). Deduplicates
+   * concurrent calls for the same key.
+   */
+  private async ensureServerRunning(key: string, cwd: string, template: SandpackTemplate): Promise<string> {
+    const existing = this.servers.get(key);
+    if (existing?.previewUrl) {
+      return existing.previewUrl;
+    }
+
+    const pending = this.serverPromises.get(key);
+    if (pending) {
+      return pending;
+    }
+
+    const server: ServerEntry = { port: this.nextPort++, process: null, previewUrl: null };
+    this.servers.set(key, server);
+
+    const promise = this.spawnServer(cwd, template, server);
+    this.serverPromises.set(key, promise);
+
+    try {
+      const url = await promise;
+      return url;
+    } finally {
+      this.serverPromises.delete(key);
+    }
+  }
+
+  /**
+   * Spawns a dev server process at the given cwd, waits for it to
+   * become ready, and returns the server URL. Shared by both
+   * template-level and project-level server startup.
+   */
+  private async spawnServer(cwd: string, template: SandpackTemplate, server: ServerEntry): Promise<string> {
+    const container = await this.boot();
+    const port = server.port;
+
+    const args = template.environment.startCommand.map((arg) => (arg === "{{port}}" ? String(port) : arg));
     const [cmd, ...cmdArgs] = args;
 
-    // --- Start dev server ---
     const url = await new Promise<string>((resolve, reject) => {
       const timeout = setTimeout(() => {
-        this.pendingServerReady.delete(project.port);
+        this.pendingServerReady.delete(port);
         reject(new Error("Dev server did not start within 60 seconds"));
       }, SERVER_TIMEOUT_MS);
 
-      this.pendingServerReady.set(project.port, {
+      this.pendingServerReady.set(port, {
         resolve: (serverUrl: string) => {
           clearTimeout(timeout);
           resolve(serverUrl);
@@ -361,8 +448,7 @@ export class WebContainerManager {
       container
         .spawn(cmd, cmdArgs, { cwd, output: true })
         .then((proc) => {
-          project.serverProcess = proc;
-          this.activeServerCount++;
+          server.process = proc;
 
           proc.output
             .pipeTo(
@@ -375,17 +461,15 @@ export class WebContainerManager {
             .catch(() => {});
 
           proc.exit.then((code) => {
-            if (project.serverProcess === proc) {
-              this.activeServerCount = Math.max(0, this.activeServerCount - 1);
-              project.serverProcess = null;
+            if (server.process === proc) {
+              server.process = null;
+              server.previewUrl = null;
             }
 
-            if (!project.previewUrl) {
-              const pending = this.pendingServerReady.get(project.port);
-              if (pending) {
-                this.pendingServerReady.delete(project.port);
-                pending.reject(new Error(`Dev server exited (code ${code}) before server was ready`));
-              }
+            const pendingReady = this.pendingServerReady.get(port);
+            if (pendingReady) {
+              this.pendingServerReady.delete(port);
+              pendingReady.reject(new Error(`Dev server exited (code ${code}) before server was ready`));
             }
           });
         })
@@ -395,29 +479,49 @@ export class WebContainerManager {
         });
     });
 
-    project.previewUrl = url;
+    server.previewUrl = url;
     return url;
   }
 
   /**
-   * Kills the dev server process for the project.
-   * The project stays registered and can be restarted with spawnDevServer().
+   * Clears the project's preview URL. In isolated mode, also kills
+   * the project's dedicated server process.
    */
   async killProject(id: string): Promise<void> {
     const project = this.projects.get(id);
     if (!project) {
       return;
     }
+    project.previewUrl = null;
+    this.cleanupProjectServer(id);
+  }
 
-    if (project.serverProcess) {
-      const proc = project.serverProcess;
-      project.serverProcess = null;
-      this.activeServerCount = Math.max(0, this.activeServerCount - 1);
-      proc.kill();
-      await proc.exit;
+  /**
+   * Kills an isolated-mode server keyed by project ID and cleans up
+   * all related tracking state. No-op for shared-mode projects
+   * (whose servers are keyed by template ID, not project ID).
+   */
+  private cleanupProjectServer(id: string): void {
+    const server = this.servers.get(id);
+    if (!server) {
+      return;
     }
 
-    project.previewUrl = null;
+    if (server.process) {
+      server.process.kill();
+    }
+
+    // If the server hadn't signaled ready yet, reject the pending
+    // callback so spawnServer's promise settles instead of hanging
+    // until the timeout fires.
+    const pending = this.pendingServerReady.get(server.port);
+    if (pending) {
+      this.pendingServerReady.delete(server.port);
+      pending.reject(new Error(`Project '${id}' server was stopped`));
+    }
+
+    this.servers.delete(id);
+    this.serverPromises.delete(id);
   }
 
   /**
@@ -437,19 +541,12 @@ export class WebContainerManager {
     if (!project) {
       return undefined;
     }
-    let status: ProjectInfo["status"];
-    if (project.previewUrl) {
-      status = "ready";
-    } else if (project.serverProcess) {
-      status = "starting";
-    } else {
-      status = "registered";
-    }
+    const status: ProjectInfo["status"] = project.previewUrl ? "ready" : "registered";
     return { previewUrl: project.previewUrl, status };
   }
 
   getActiveServerCount(): number {
-    return this.activeServerCount;
+    return this.servers.size;
   }
 
   private getProjectOrThrow(id: string): ProjectState {

@@ -13,7 +13,9 @@ export type SandpackFiles = Record<string, SandpackFile>;
 
 export interface SandpackTemplate {
   id: string;
-  files: SandpackFiles;
+  serverMode?: 'shared' | 'isolated';
+  sharedFiles: SandpackFiles;
+  appFiles: SandpackFiles;
   environment: {
     packageJson: string;
     packageLockJson?: string;
@@ -21,9 +23,24 @@ export interface SandpackTemplate {
   };
 }
 
+function applyDefaultHidden(files: SandpackFiles): SandpackFiles {
+  return Object.fromEntries(
+    Object.entries(files).map(([path, file]) => [
+      path,
+      file.hidden === false ? file : {...file, hidden: true},
+    ])
+  );
+}
+
 export function defineTemplate(template: SandpackTemplate): SandpackTemplate {
   if (!template.id) {
     throw new Error('SandpackTemplate requires a non-empty id');
+  }
+  if (!template.sharedFiles || typeof template.sharedFiles !== 'object') {
+    throw new Error('SandpackTemplate requires sharedFiles');
+  }
+  if (!template.appFiles || typeof template.appFiles !== 'object') {
+    throw new Error('SandpackTemplate requires appFiles');
   }
   if (!template.environment.packageJson) {
     throw new Error('SandpackTemplate requires environment.packageJson');
@@ -36,7 +53,11 @@ export function defineTemplate(template: SandpackTemplate): SandpackTemplate {
       'SandpackTemplate requires a non-empty environment.startCommand'
     );
   }
-  return template;
+  return {
+    ...template,
+    sharedFiles: applyDefaultHidden(template.sharedFiles),
+    appFiles: applyDefaultHidden(template.appFiles),
+  };
 }
 
 // ---- Status ----

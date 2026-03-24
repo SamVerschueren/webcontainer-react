@@ -56,9 +56,10 @@ export function SandpackProvider({
   // Stable project ID, generated once per mount
   const [projectId] = useState(() => `sp-${nextProjectId++}`);
 
-  // Snapshot of merged template + user files at mount time (user wins)
+  // Snapshot of all files at mount time (user wins over app, app wins over shared)
   const initialFilesRef = useRef<SandpackFiles>({
-    ...template.files,
+    ...template.sharedFiles,
+    ...template.appFiles,
     ...userFiles,
   });
 
@@ -237,6 +238,7 @@ export function SandpackProvider({
 
       const data = event.data;
       if (!data || typeof data.type !== 'string') return;
+      if (data.projectId && data.projectId !== projectId) return;
 
       if (
         (data.type === 'console' && data.codesandbox === true) ||
@@ -248,7 +250,7 @@ export function SandpackProvider({
 
     window.addEventListener('message', onMessage);
     return () => window.removeEventListener('message', onMessage);
-  }, [emit, basePreviewUrl]);
+  }, [emit, basePreviewUrl, projectId]);
 
   // ---- Build context value ----
 
