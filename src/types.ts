@@ -101,6 +101,9 @@ export type SandpackMessage =
 export interface SandpackError {
   title: string;
   message: string;
+  line?: number;
+  column?: number;
+  path?: string;
 }
 
 // ---- Theme ----

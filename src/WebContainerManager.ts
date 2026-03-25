@@ -1,5 +1,6 @@
 import type { WebContainer, WebContainerProcess } from "@webcontainer/api";
 import type { SandpackFiles, SandpackListener, SandpackMessage, SandpackTemplate } from "./types";
+import errorReporterSource from "virtual:error-reporter-source";
 
 export interface ProjectInfo {
   previewUrl: string | null;
@@ -21,6 +22,27 @@ interface ServerEntry {
 
 const BASE_PORT = 5173;
 const SERVER_TIMEOUT_MS = 60_000;
+const PLUGINS_DIR = "/webcontainer-vite-plugins";
+
+function viteConfigWrapper(depth: number): string {
+  const prefix = "../".repeat(depth);
+  return `import {defineConfig, mergeConfig} from 'vite';
+import {debugMappedErrors} from '${prefix}webcontainer-vite-plugins/error-reporter.js';
+import baseConfig from './vite.config.base.js';
+
+export default mergeConfig(
+    baseConfig,
+    defineConfig({
+        plugins: [debugMappedErrors()],
+        server: {
+          hmr: {
+            overlay: false,
+          }
+        },
+    }),
+);
+`;
+}
 
 /**
  * Injected into every preview iframe via setPreviewScript to bridge
@@ -44,7 +66,7 @@ const BRIDGE_SCRIPT = `(function() {
       const args = Array.prototype.slice.call(arguments);
       const data = args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a));
 
-      if (method === 'debug' && data.join('').startsWith('[vite]')) {
+      if (data.join('').startsWith('[vite]')) {
         return;
       }
 
@@ -73,18 +95,18 @@ const BRIDGE_SCRIPT = `(function() {
   };
 
   // --- Resize observation ---
+  function sendResize(height) {
+    window.parent.postMessage({ type: 'resize', height, projectId }, '*');
+  }
+
   function observeResize() {
     var root = document.getElementById('root') || document.body;
-    new ResizeObserver(function(entries) {
+    new ResizeObserver(function() {
       const { body } = document;
       const html = document.documentElement;
-      const height = Math.max(body.scrollHeight, body.offsetHeight, html.offsetHeight);
-
-      window.parent.postMessage({
-        type: 'resize',
-        height,
-        projectId,
-      }, '*');
+      var overlay = document.querySelector('vite-error-overlay');
+      const height = Math.max(body.scrollHeight, body.offsetHeight, html.offsetHeight, overlay ? 300 : 0);
+      sendResize(height);
     }).observe(root);
   }
 
@@ -93,36 +115,6 @@ const BRIDGE_SCRIPT = `(function() {
   } else {
     observeResize();
   }
-
-  // --- Uncaught error forwarding ---
-  window.addEventListener('error', function(event) {
-    window.parent.postMessage({
-      type: 'console',
-      codesandbox: true,
-      projectId,
-      log: [{
-        method: 'error',
-        id: String(_msgId++),
-        data: [event.message || 'Unknown error']
-      }]
-    }, '*');
-  });
-
-  window.addEventListener('unhandledrejection', function(event) {
-    var msg = event.reason && event.reason.message
-      ? event.reason.message
-      : String(event.reason || 'Unhandled promise rejection');
-    window.parent.postMessage({
-      type: 'console',
-      codesandbox: true,
-      projectId,
-      log: [{
-        method: 'error',
-        id: String(_msgId++),
-        data: [msg]
-      }]
-    }, '*');
-  });
 })();`;
 
 /**
@@ -172,11 +164,20 @@ export class WebContainerManager {
       .then(async (container) => {
         this.container = container;
         this.setupContainerListeners(container);
-        await container.setPreviewScript(BRIDGE_SCRIPT);
+        await Promise.all([container.setPreviewScript(BRIDGE_SCRIPT), this.writeGlobalPlugins(container)]);
         return container;
       });
 
     return this.bootPromise;
+  }
+
+  /**
+   * Writes bundled Vite plugins to a global directory so that all
+   * templates can import them via relative paths. Called once during boot.
+   */
+  private async writeGlobalPlugins(container: WebContainer): Promise<void> {
+    await container.fs.mkdir(PLUGINS_DIR, { recursive: true });
+    await container.fs.writeFile(`${PLUGINS_DIR}/error-reporter.js`, errorReporterSource);
   }
 
   /**
@@ -229,8 +230,17 @@ export class WebContainerManager {
     for (const sharedDir of Array.from(sharedDirs).sort()) {
       await container.fs.mkdir(sharedDir, { recursive: true });
     }
+    let hasViteConfig = false;
     for (const [filePath, file] of Object.entries(template.sharedFiles)) {
-      await container.fs.writeFile(`${dir}${filePath}`, file.code);
+      if (filePath === "/vite.config.js") {
+        hasViteConfig = true;
+        await container.fs.writeFile(`${dir}/vite.config.base.js`, file.code);
+      } else {
+        await container.fs.writeFile(`${dir}${filePath}`, file.code);
+      }
+    }
+    if (hasViteConfig) {
+      await container.fs.writeFile(`${dir}/vite.config.js`, viteConfigWrapper(2));
     }
 
     const install = await container.spawn("npm", ["install"], { cwd: dir, output: true });
@@ -329,8 +339,17 @@ export class WebContainerManager {
       await container.fs.mkdir(dir, { recursive: true });
     }
 
+    let hasViteConfig = false;
     for (const [filePath, file] of Object.entries(filesToWrite)) {
-      await container.fs.writeFile(`${base}${filePath}`, file.code);
+      if (filePath === "/vite.config.js") {
+        hasViteConfig = true;
+        await container.fs.writeFile(`${base}/vite.config.base.js`, file.code);
+      } else {
+        await container.fs.writeFile(`${base}${filePath}`, file.code);
+      }
+    }
+    if (hasViteConfig) {
+      await container.fs.writeFile(`${base}/vite.config.js`, viteConfigWrapper(4));
     }
 
     Object.assign(project.files, files);

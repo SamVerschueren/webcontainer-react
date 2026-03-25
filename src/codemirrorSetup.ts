@@ -59,6 +59,10 @@ export const cmTheme = EditorView.theme({
     backgroundColor: 'var(--sp-colors-surface3)',
     borderRadius: 'var(--sp-border-radius)',
   },
+  '.cm-errorLine': {
+    backgroundColor: 'var(--sp-colors-errorSurface)',
+    borderRadius: 'var(--sp-border-radius)',
+  },
   '.cm-content': {
     caretColor: 'var(--sp-colors-accent, var(--sp-syntax-color-plain))',
     padding: '0 var(--sp-space-4, 16px)',

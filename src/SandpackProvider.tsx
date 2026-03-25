@@ -41,6 +41,40 @@ function filesToCodeMap(
   return result;
 }
 
+function buildCodeFrame(
+  source: string | undefined,
+  location: {line: number; column: number}
+): string {
+  if (!source) return '';
+
+  const lines = source.split('\n');
+
+  const start = Math.max(0, location.line - 3);
+  const end = Math.min(location.line + 3, lines.length);
+
+  const numberLength = `${end}`.length + 2;
+
+  const frames = [];
+
+  for (let i = start; i < end; i++) {
+    const isErrorLine = i + 1 === location.line;
+
+    const prefix = isErrorLine
+      ? '>' + `${i + 1}`.padStart(numberLength - 1, ' ')
+      : `${i + 1}`.padStart(numberLength, ' ');
+
+    frames.push(`${prefix} | ${lines[i]}`);
+
+    if (isErrorLine) {
+      const gutter = ' '.repeat(numberLength);
+
+      frames.push(`${gutter} | ` + '^'.padStart(location.column + 1));
+    }
+  }
+
+  return frames.join('\n');
+}
+
 export function SandpackProvider({
   template,
   files: userFiles,
@@ -82,6 +116,8 @@ export function SandpackProvider({
 
   const containerRef = useRef<HTMLDivElement>(null);
   const listenersRef = useRef(new Set<SandpackListener>());
+  const filesRef = useRef(files);
+  filesRef.current = files;
   const manager = useMemo(() => WebContainerManager.getInstance(), []);
 
   // ---- Derived ----
@@ -233,12 +269,60 @@ export function SandpackProvider({
       return;
     }
 
+    let lastMessageTimestamp = 0;
+
     function onMessage(event: MessageEvent) {
       if (event.origin !== expectedOrigin) return;
 
       const data = event.data;
       if (!data || typeof data.type !== 'string') return;
       if (data.projectId && data.projectId !== projectId) return;
+
+      if (data.timestamp && data.timestamp < lastMessageTimestamp) return;
+
+      lastMessageTimestamp = data.timestamp;
+
+      if (data.type === 'show-error') {
+        const fsPrefixRe = new RegExp(`\\/home\\/[^/]+\\/templates\\/[^/]+\\/projects\\/${data.projectId}`, 'g');
+        const stripContainerPath = (s: string) => s.replace(fsPrefixRe, '');
+
+        const error = data.error;
+
+        if (error.type === 'vite:error') {
+          setError({
+            title: 'Error',
+            message: stripContainerPath(error.message),
+            line: error.line,
+            column: error.column,
+            path: error.file,
+          });
+        } else {
+          const codeFrame = buildCodeFrame(
+            filesRef.current[error.file]?.code,
+            {
+              line: error.line,
+              column: error.column,
+            }
+          );
+
+          const message = `${error.file}: ${error.message} (${error.line}:${error.column})\n\n${codeFrame}`;
+
+          setError({
+            title: 'Runtime Error',
+            message,
+            line: error.line,
+            column: error.column,
+            path: error.file,
+          });
+        }
+
+        return;
+      }
+
+      if (data.type === 'clear-error') {
+        setError(null);
+        return;
+      }
 
       if (
         (data.type === 'console' && data.codesandbox === true) ||
@@ -250,7 +334,7 @@ export function SandpackProvider({
 
     window.addEventListener('message', onMessage);
     return () => window.removeEventListener('message', onMessage);
-  }, [emit, basePreviewUrl, projectId]);
+  }, [emit, basePreviewUrl, projectId, setError]);
 
   // ---- Build context value ----
 

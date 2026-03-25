@@ -13,6 +13,7 @@ import {bracketMatching, syntaxHighlighting} from '@codemirror/language';
 import {useActiveCode} from '../hooks/useActiveCode';
 import {useSandpack} from '../hooks/useSandpack';
 import {cmTheme, sandpackHighlighter, getLanguageExtension} from '../codemirrorSetup';
+import {highlightInlineError, showErrorAnnotation, removeErrorsAnnotation} from '../codemirrorErrorHighlight';
 import type {SandpackCodeEditorProps} from '../types';
 
 export function SandpackCodeEditor({
@@ -70,6 +71,7 @@ export function SandpackCodeEditor({
     const extensionList = [
       highlightSpecialChars(),
       history(),
+      highlightInlineError(),
       ...extraExtensions,
       keymap.of([
         ...defaultKeymap,
@@ -127,6 +129,24 @@ export function SandpackCodeEditor({
       viewRef.current?.destroy();
     };
   }, [createView]);
+
+  const error = sandpack.error;
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+
+    if (
+      error?.line &&
+      (!error.path || error.path === activeFile || error.path.endsWith(activeFile))
+    ) {
+      const maxLine = view.state.doc.lines;
+      if (error.line >= 1 && error.line <= maxLine) {
+        view.dispatch({annotations: showErrorAnnotation.of(error.line)});
+      }
+    } else {
+      view.dispatch({annotations: removeErrorsAnnotation.of(true)});
+    }
+  }, [error, activeFile]);
 
   useEffect(() => {
     const view = viewRef.current;
