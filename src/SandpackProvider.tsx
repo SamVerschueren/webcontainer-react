@@ -283,20 +283,11 @@ export function SandpackProvider({
       lastMessageTimestamp = data.timestamp;
 
       if (data.type === 'show-error') {
-        const fsPrefixRe = new RegExp(`\\/home\\/[^/]+\\/templates\\/[^/]+\\/projects\\/${data.projectId}`, 'g');
-        const stripContainerPath = (s: string) => s.replace(fsPrefixRe, '');
-
         const error = data.error;
 
-        if (error.type === 'vite:error') {
-          setError({
-            title: 'Error',
-            message: stripContainerPath(error.message),
-            line: error.line,
-            column: error.column,
-            path: error.file,
-          });
-        } else {
+        let message = `${error.file}: ${error.message}`;
+
+        if (error.line && error.column) {
           const codeFrame = buildCodeFrame(
             filesRef.current[error.file]?.code,
             {
@@ -305,16 +296,16 @@ export function SandpackProvider({
             }
           );
 
-          const message = `${error.file}: ${error.message} (${error.line}:${error.column})\n\n${codeFrame}`;
-
-          setError({
-            title: 'Runtime Error',
-            message,
-            line: error.line,
-            column: error.column,
-            path: error.file,
-          });
+          message += ` (${error.line}:${error.column})\n\n${codeFrame}`;
         }
+
+        setError({
+          title: error.title ?? 'Error',
+          message,
+          line: error.line,
+          column: error.column,
+          path: error.file,
+        });
 
         return;
       }

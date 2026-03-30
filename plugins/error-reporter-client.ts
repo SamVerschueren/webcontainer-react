@@ -2,22 +2,36 @@
 
 import { parseStack as _parseStack } from "virtual:error-stack-parser";
 
-const _match = window.location.pathname.match(/\/projects\/([^\/]+)/);
+const PROJECT_PATH_RE = /(?:\/home\/[^/]+\/templates\/[^/]+)?\/projects\/([^\/]+)/;
+
+const _match = window.location.pathname.match(PROJECT_PATH_RE);
 
 const projectId = _match ? _match[1] : null;
 
 function parseStack(stack: string) {
   if (!stack) return [];
-  return _parseStack(stack)
-    .filter((f) => f.file && f.file.includes("/projects/"))
-    .map((f) => ({ file: f.file, line: f.line, column: f.col }));
+  return _parseStack(stack).map((f) => ({ file: f.file, line: f.line, column: f.col }));
 }
 
 async function send(error: Error) {
   const stack = error && typeof error === "object" && "stack" in error ? String(error.stack || "") : "";
 
   const frames = parseStack(stack);
-  if (frames.length === 0) return;
+
+  if (frames.length === 0) {
+    return;
+  }
+
+  if (frames[0].file.startsWith("about://React/")) {
+    const file = frames[0].file.split("file://")[1];
+
+    sendError({
+      title: "Runtime Error",
+      file,
+      message: error.message,
+      stack: error.stack,
+    });
+  }
 
   const response = await fetch("/__stack-map", {
     method: "POST",
@@ -32,6 +46,7 @@ async function send(error: Error) {
   if (!frame) return;
 
   sendError({
+    title: "Runtime Error",
     message: error.message,
     stack: error.stack,
     file: frame.file,
@@ -43,7 +58,7 @@ async function send(error: Error) {
 function sendError(error: Record<string, any>) {
   error.file = new URL(error.file, "ws://x").pathname;
 
-  const match = error.file.match(/(?:\/home\/[^/]+\/templates\/[^/]+)?\/projects\/([^\/]+)/);
+  const match = error.file.match(PROJECT_PATH_RE);
 
   const parsedProjectId = match ? match[1] : null;
 
@@ -57,6 +72,21 @@ function sendError(error: Record<string, any>) {
       timestamp: Date.now(),
       projectId: parsedProjectId ?? projectId,
       error,
+    },
+    "*",
+  );
+}
+
+function clearError(event?: { file: string }) {
+  const match = event?.file.match(PROJECT_PATH_RE);
+
+  const parsedProjectId = match ? match[1] : null;
+
+  window.parent.postMessage(
+    {
+      type: "clear-error",
+      timestamp: Date.now(),
+      projectId: parsedProjectId ?? projectId,
     },
     "*",
   );
@@ -78,25 +108,31 @@ if (import.meta.hot) {
 
     const error = event.err;
 
+    if (error.plugin === "vite:react-babel") {
+      const match = error.message.match(new RegExp(`^${error.id}: (.*?) \\(${error.loc.line}:${error.loc.column}\\)$`));
+
+      if (match) {
+        error.message = match[1];
+      }
+    } else if (error.plugin === "vite:esbuild") {
+      error.message = error.frame.trim().split("\n")[0];
+    }
+
     sendError({
-      type: "vite:error",
+      title: "Error",
       message: error.message,
       stack: error.stack,
       file: error.id,
       line: error.loc.line,
       column: error.loc.column,
-      frame: error.frame,
     });
   });
 
   import.meta.hot.on("vite:beforeUpdate", () => {
-    window.parent.postMessage(
-      {
-        type: "clear-error",
-        projectId,
-        timestamp: Date.now(),
-      },
-      "*",
-    );
+    clearError();
+  });
+
+  import.meta.hot.on("rsc:update", (event: { file: string }) => {
+    clearError({ file: event.file });
   });
 }

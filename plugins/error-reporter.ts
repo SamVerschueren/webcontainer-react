@@ -40,35 +40,25 @@ export function debugMappedErrors(): Plugin {
     },
 
     configureServer(server: ViteDevServer) {
-      server.middlewares.use(
-        "/__stack-map",
-        async (
-          req: Connect.IncomingMessage,
-          res: ServerResponse,
-        ) => {
-          try {
-            const body = await readJson(req);
-            const frames: StackFrame[] = (body as { frames?: StackFrame[] })
-              .frames ?? [];
+      server.middlewares.use("/__stack-map", async (req: Connect.IncomingMessage, res: ServerResponse) => {
+        try {
+          const body = await readJson(req);
+          const frames: StackFrame[] = (body as { frames?: StackFrame[] }).frames ?? [];
 
-            const mapped = await Promise.all(
-              frames.map((frame) => mapFrame(server, frame)),
-            );
+          const mapped = await Promise.all(frames.map((frame) => mapFrame(server, frame)));
 
-            res.setHeader("Content-Type", "application/json");
-            res.end(JSON.stringify({ frames: mapped }));
-          } catch (error) {
-            res.statusCode = 500;
-            res.setHeader("Content-Type", "application/json");
-            res.end(
-              JSON.stringify({
-                error:
-                  error instanceof Error ? error.message : String(error),
-              }),
-            );
-          }
-        },
-      );
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ frames: mapped }));
+        } catch (error) {
+          res.statusCode = 500;
+          res.setHeader("Content-Type", "application/json");
+          res.end(
+            JSON.stringify({
+              error: error instanceof Error ? error.message : String(error),
+            }),
+          );
+        }
+      });
     },
 
     transformIndexHtml: {
@@ -119,6 +109,7 @@ async function mapFrame(server: ViteDevServer, frame: StackFrame) {
     return {
       ...frame,
       file: url,
+      reason: "no-sourcemap-position",
     };
   }
 
