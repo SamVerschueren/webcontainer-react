@@ -61,20 +61,17 @@ export function debugMappedErrors(): Plugin {
       });
     },
 
-    transformIndexHtml: {
-      order: "post",
-      handler() {
-        return [
-          {
-            tag: "script",
-            attrs: {
-              type: "module",
-              src: "/@id/" + VIRTUAL_ID,
-            },
-            injectTo: "head" as const,
-          },
-        ];
-      },
+    transform(code: string, id: string) {
+      if (
+        this.environment.name === "client" &&
+        !id.includes("node_modules") &&
+        /\.[jt]sx?$/.test(id) &&
+        !code.includes(VIRTUAL_ID)
+      ) {
+        return `import "${VIRTUAL_ID}";${code}`;
+      }
+
+      return undefined;
     },
   };
 }

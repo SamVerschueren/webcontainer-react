@@ -10,7 +10,9 @@ const projectId = _match ? _match[1] : null;
 
 function parseStack(stack: string) {
   if (!stack) return [];
-  return _parseStack(stack).map((f) => ({ file: f.file, line: f.line, column: f.col }));
+  return _parseStack(stack)
+    .filter((f) => f.file && !f.file.includes("/node_modules/"))
+    .map((f) => ({ file: f.file, line: f.line, column: f.col }));
 }
 
 async function send(error: Error) {
@@ -31,6 +33,8 @@ async function send(error: Error) {
       message: error.message,
       stack: error.stack,
     });
+
+    return;
   }
 
   const response = await fetch("/__stack-map", {
@@ -109,7 +113,9 @@ if (import.meta.hot) {
     const error = event.err;
 
     if (error.plugin === "vite:react-babel") {
-      const match = error.message.match(new RegExp(`^${error.id}: (.*?) \\(${error.loc.line}:${error.loc.column}\\)$`));
+      const match = error.message.match(
+        new RegExp(`^${error.id}: (.*?) \\(${error.loc.line}:${error.loc.column}\\)$`, "m"),
+      );
 
       if (match) {
         error.message = match[1];
