@@ -64,7 +64,9 @@ export function defineTemplate(template: SandpackTemplate): SandpackTemplate {
 
 export type SandpackStatus =
   | 'initial'
+  | 'booting'
   | 'installing'
+  | 'starting'
   | 'running'
   | 'idle'
   | 'timeout';

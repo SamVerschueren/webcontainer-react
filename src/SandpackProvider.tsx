@@ -223,20 +223,22 @@ export function SandpackProvider({
 
     (async () => {
       try {
-        setStatus('installing');
+        setStatus('booting');
         await manager.boot();
         if (cancelled) return;
 
+        setStatus('installing');
         await manager.ensureTemplateInstalled(template);
         if (cancelled) return;
 
         await manager.mountFiles(projectId, initialFilesRef.current);
         if (cancelled) return;
 
-        setStatus('running');
+        setStatus('starting');
         const url = await manager.spawnDevServer(projectId, template);
         if (cancelled) return;
 
+        setStatus('running');
         setBasePreviewUrl(url);
       } catch (err) {
         if (cancelled) return;
