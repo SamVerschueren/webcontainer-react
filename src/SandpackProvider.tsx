@@ -287,7 +287,7 @@ export function SandpackProvider({
 
         let message = `${error.file}: ${error.message}`;
 
-        if (error.line && error.column) {
+        if (typeof error.line === 'number' && typeof error.column === 'number') {
           const codeFrame = buildCodeFrame(
             filesRef.current[error.file]?.code,
             {
@@ -296,14 +296,14 @@ export function SandpackProvider({
             }
           );
 
-          message += ` (${error.line}:${error.column})\n\n${codeFrame}`;
+          message += ` (${error.line}:${error.column + 1})\n\n${codeFrame}`;
         }
 
         setError({
           title: error.title ?? 'Error',
           message,
           line: error.line,
-          column: error.column,
+          column: error.column + 1,
           path: error.file,
         });
 
