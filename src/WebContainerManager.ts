@@ -25,15 +25,27 @@ const SERVER_TIMEOUT_MS = 60_000;
 const PLUGINS_DIR = "/webcontainer-vite-plugins";
 
 function viteConfigWrapper(depth: number): string {
+  // we also run the esbuild transform on js files so we get syntax errors
   const prefix = "../".repeat(depth);
-  return `import {defineConfig, mergeConfig} from 'vite';
+  return `import {defineConfig, mergeConfig, transformWithEsbuild} from 'vite';
 import {debugMappedErrors} from '${prefix}webcontainer-vite-plugins/error-reporter.js';
 import baseConfig from './vite.config.base.js';
 
 export default mergeConfig(
     baseConfig,
     defineConfig({
-        plugins: [debugMappedErrors()],
+        plugins: [
+            debugMappedErrors(),
+            {
+                name: 'sandpack:transform',
+                enforce: 'pre',
+                async transform(code, id) {
+                    if (id.endsWith('.js') && !id.includes('node_modules')) {
+                      await transformWithEsbuild(code, id, {loader: 'js'});
+                    }
+                }
+            }
+        ],
         server: {
           hmr: {
             overlay: false,

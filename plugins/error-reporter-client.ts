@@ -96,6 +96,8 @@ function clearError(event?: { file: string }) {
   );
 }
 
+clearError();
+
 window.addEventListener("error", (event) => {
   send(event.error ?? new Error(event.message));
 });
@@ -122,6 +124,14 @@ if (import.meta.hot) {
       }
     } else if (error.plugin === "vite:esbuild") {
       error.message = error.frame.trim().split("\n")[0];
+    } else if (error.plugin === "sandpack:transform") {
+      const match = error.message.match(
+        new RegExp(`^${error.id}:${error.loc.line}:${error.loc.column}: (?:.*?): (.*?)$`, "m"),
+      );
+
+      if (match) {
+        error.message = match[1];
+      }
     }
 
     sendError({
@@ -135,6 +145,10 @@ if (import.meta.hot) {
   });
 
   import.meta.hot.on("vite:beforeUpdate", () => {
+    clearError();
+  });
+
+  import.meta.hot.on("vite:beforeFullReload", () => {
     clearError();
   });
 
